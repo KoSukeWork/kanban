@@ -2,9 +2,8 @@ import * as pty from "node-pty";
 
 import {
 	buildWindowsCmdArgsCommandLine,
-	resolveWindowsBinary,
 	resolveWindowsComSpec,
-	shouldUseWindowsCmdLaunch,
+	resolveWindowsLaunchDecision,
 } from "../core/windows-cmd-launch";
 
 export interface PtyExitEvent {
@@ -88,9 +87,9 @@ export class PtySession {
 		const normalizedArgs = typeof args === "string" ? [args] : args;
 		const terminalName = env?.TERM?.trim() || process.env.TERM?.trim() || "xterm-256color";
 		const launchEnv: NodeJS.ProcessEnv = env ? { ...process.env, ...env } : process.env;
-		const useWindowsShellLaunch = shouldUseWindowsCmdLaunch(binary, process.platform, launchEnv);
-		const resolvedWindowsBinary =
-			!useWindowsShellLaunch && process.platform === "win32" ? resolveWindowsBinary(binary, launchEnv) : null;
+		const windowsLaunchDecision = resolveWindowsLaunchDecision(binary, process.platform, launchEnv);
+		const useWindowsShellLaunch = windowsLaunchDecision.useWindowsShellLaunch;
+		const resolvedWindowsBinary = windowsLaunchDecision.resolvedBinary;
 		const spawnBinary = useWindowsShellLaunch
 			? resolveWindowsComSpec(launchEnv)
 			: (resolvedWindowsBinary?.path ?? binary);

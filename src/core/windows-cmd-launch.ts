@@ -11,6 +11,11 @@ export interface ResolvedWindowsBinary {
 	extension: string;
 }
 
+export interface WindowsLaunchDecision {
+	useWindowsShellLaunch: boolean;
+	resolvedBinary: ResolvedWindowsBinary | null;
+}
+
 // `process.env` behaves case-insensitively on Windows, but once we copy env into a
 // plain object for child-process merging we need to preserve that behavior ourselves.
 function getWindowsEnvValue(env: NodeJS.ProcessEnv, key: string): string | undefined {
@@ -59,7 +64,10 @@ function getWindowsPathExtensions(env: NodeJS.ProcessEnv): string[] {
 	return configured;
 }
 
-export function resolveWindowsBinary(binary: string, env: NodeJS.ProcessEnv = process.env): ResolvedWindowsBinary | null {
+export function resolveWindowsBinary(
+	binary: string,
+	env: NodeJS.ProcessEnv = process.env,
+): ResolvedWindowsBinary | null {
 	const trimmed = binary.trim();
 	if (!trimmed) {
 		return null;
@@ -74,6 +82,9 @@ export function resolveWindowsBinary(binary: string, env: NodeJS.ProcessEnv = pr
 				path: trimmed,
 				extension: extension.toLowerCase(),
 			};
+		}
+		if (extension) {
+			return null;
 		}
 		for (const pathExtension of pathExtensions) {
 			const candidate = `${trimmed}${pathExtension}`;
@@ -108,14 +119,6 @@ export function resolveWindowsBinary(binary: string, env: NodeJS.ProcessEnv = pr
 		}
 	}
 	return null;
-}
-
-function resolveWindowsBinaryExtension(binary: string, env: NodeJS.ProcessEnv): string | null {
-	const explicitExtension = extname(binary.trim());
-	if (explicitExtension) {
-		return explicitExtension.toLowerCase();
-	}
-	return resolveWindowsBinary(binary, env)?.extension ?? null;
 }
 
 function normalizeWindowsCmdArgument(value: string): string {
@@ -154,40 +157,76 @@ export function buildWindowsCmdArgsArray(binary: string, args: string[]): string
 	return ["/d", "/s", "/c", `"${shellCommand}"`];
 }
 
+export function resolveWindowsLaunchDecision(
+	binary: string,
+	platform: NodeJS.Platform = process.platform,
+	env: NodeJS.ProcessEnv = process.env,
+): WindowsLaunchDecision {
+	if (platform !== "win32") {
+		return {
+			useWindowsShellLaunch: false,
+			resolvedBinary: null,
+		};
+	}
+
+	const normalized = binary.trim().toLowerCase();
+	if (!normalized) {
+		return {
+			useWindowsShellLaunch: false,
+			resolvedBinary: null,
+		};
+	}
+	if (normalized === "cmd" || normalized === "cmd.exe") {
+		return {
+			useWindowsShellLaunch: false,
+			resolvedBinary: null,
+		};
+	}
+	if (normalized === resolveWindowsComSpec(env).toLowerCase()) {
+		return {
+			useWindowsShellLaunch: false,
+			resolvedBinary: null,
+		};
+	}
+
+	const explicitExtension = extname(normalized).toLowerCase();
+	if (WINDOWS_CMD_EXTENSIONS.has(explicitExtension)) {
+		return {
+			useWindowsShellLaunch: true,
+			resolvedBinary: null,
+		};
+	}
+	if (WINDOWS_DIRECT_EXTENSIONS.has(explicitExtension)) {
+		return {
+			useWindowsShellLaunch: false,
+			resolvedBinary: null,
+		};
+	}
+
+	const resolvedBinary = resolveWindowsBinary(binary, env);
+	if (resolvedBinary && WINDOWS_DIRECT_EXTENSIONS.has(resolvedBinary.extension)) {
+		return {
+			useWindowsShellLaunch: false,
+			resolvedBinary,
+		};
+	}
+	if (resolvedBinary && WINDOWS_CMD_EXTENSIONS.has(resolvedBinary.extension)) {
+		return {
+			useWindowsShellLaunch: true,
+			resolvedBinary: null,
+		};
+	}
+
+	return {
+		useWindowsShellLaunch: true,
+		resolvedBinary: null,
+	};
+}
+
 export function shouldUseWindowsCmdLaunch(
 	binary: string,
 	platform: NodeJS.Platform = process.platform,
 	env: NodeJS.ProcessEnv = process.env,
 ): boolean {
-	if (platform !== "win32") {
-		return false;
-	}
-	const normalized = binary.trim().toLowerCase();
-	if (!normalized) {
-		return false;
-	}
-	if (normalized === "cmd" || normalized === "cmd.exe") {
-		return false;
-	}
-	if (normalized === resolveWindowsComSpec(env).toLowerCase()) {
-		return false;
-	}
-
-	const explicitExtension = extname(normalized).toLowerCase();
-	if (WINDOWS_CMD_EXTENSIONS.has(explicitExtension)) {
-		return true;
-	}
-	if (WINDOWS_DIRECT_EXTENSIONS.has(explicitExtension)) {
-		return false;
-	}
-
-	const resolvedExtension = resolveWindowsBinaryExtension(binary, env);
-	if (resolvedExtension && WINDOWS_DIRECT_EXTENSIONS.has(resolvedExtension)) {
-		return false;
-	}
-	if (resolvedExtension && WINDOWS_CMD_EXTENSIONS.has(resolvedExtension)) {
-		return true;
-	}
-
-	return true;
+	return resolveWindowsLaunchDecision(binary, platform, env).useWindowsShellLaunch;
 }
