@@ -3,7 +3,11 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 
-import { resolveWindowsBinary, shouldUseWindowsCmdLaunch } from "../../../src/core/windows-cmd-launch";
+import {
+	resolveWindowsBinary,
+	resolveWindowsLaunchDecision,
+	shouldUseWindowsCmdLaunch,
+} from "../../../src/core/windows-cmd-launch";
 
 function createWindowsBinary(directory: string, fileName: string): string {
 	const filePath = join(directory, fileName);
@@ -54,6 +58,30 @@ describe("shouldUseWindowsCmdLaunch", () => {
 			path: binaryPath,
 			extension: ".exe",
 		});
+		expect(
+			resolveWindowsLaunchDecision("codex", "win32", {
+				PATH: tempDirectory,
+				PATHEXT: ".com;.exe;.bat;.cmd",
+				ComSpec: "C:\\Windows\\System32\\cmd.exe",
+			}),
+		).toEqual({
+			useWindowsShellLaunch: false,
+			resolvedBinary: {
+				path: binaryPath,
+				extension: ".exe",
+			},
+		});
+	});
+
+	it("does not append PATHEXT to path-qualified binaries with explicit extensions", () => {
+		const tempDirectory = mkdtempSync(join(tmpdir(), "kanban-win-launch-"));
+		tempDirectories.push(tempDirectory);
+
+		expect(
+			resolveWindowsBinary(join(tempDirectory, "missing.exe"), {
+				PATHEXT: ".com;.exe;.bat;.cmd",
+			}),
+		).toBeNull();
 	});
 
 	it("treats Windows env keys case-insensitively when PATH resolves a bare binary to .exe", () => {
