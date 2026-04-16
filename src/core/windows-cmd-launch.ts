@@ -6,6 +6,11 @@ const WINDOWS_CMD_EXTENSIONS = new Set([".cmd", ".bat"]);
 const WINDOWS_DIRECT_EXTENSIONS = new Set([".exe", ".com"]);
 const DEFAULT_WINDOWS_PATHEXT = [".COM", ".EXE", ".BAT", ".CMD"];
 
+export interface ResolvedWindowsBinary {
+	path: string;
+	extension: string;
+}
+
 // `process.env` behaves case-insensitively on Windows, but once we copy env into a
 // plain object for child-process merging we need to preserve that behavior ourselves.
 function getWindowsEnvValue(env: NodeJS.ProcessEnv, key: string): string | undefined {
@@ -54,24 +59,29 @@ function getWindowsPathExtensions(env: NodeJS.ProcessEnv): string[] {
 	return configured;
 }
 
-function resolveWindowsBinaryExtension(binary: string, env: NodeJS.ProcessEnv): string | null {
+export function resolveWindowsBinary(binary: string, env: NodeJS.ProcessEnv = process.env): ResolvedWindowsBinary | null {
 	const trimmed = binary.trim();
 	if (!trimmed) {
 		return null;
 	}
 
 	const extension = extname(trimmed);
-	if (extension) {
-		return extension.toLowerCase();
-	}
-
 	const pathExtensions = getWindowsPathExtensions(env);
 	const hasDirectorySeparators = trimmed.includes("\\") || trimmed.includes("/");
 	if (hasDirectorySeparators) {
+		if (extension && canAccessPath(trimmed)) {
+			return {
+				path: trimmed,
+				extension: extension.toLowerCase(),
+			};
+		}
 		for (const pathExtension of pathExtensions) {
 			const candidate = `${trimmed}${pathExtension}`;
 			if (canAccessPath(candidate)) {
-				return pathExtension.toLowerCase();
+				return {
+					path: candidate,
+					extension: pathExtension.toLowerCase(),
+				};
 			}
 		}
 		return null;
@@ -86,14 +96,26 @@ function resolveWindowsBinaryExtension(binary: string, env: NodeJS.ProcessEnv): 
 	}
 
 	for (const pathEntry of pathEntries) {
-		for (const pathExtension of pathExtensions) {
-			const candidate = join(pathEntry, `${trimmed}${pathExtension}`);
+		const candidates = extension ? [trimmed] : pathExtensions.map((pathExtension) => `${trimmed}${pathExtension}`);
+		for (const candidateName of candidates) {
+			const candidate = join(pathEntry, candidateName);
 			if (canAccessPath(candidate)) {
-				return pathExtension.toLowerCase();
+				return {
+					path: candidate,
+					extension: extname(candidate).toLowerCase(),
+				};
 			}
 		}
 	}
 	return null;
+}
+
+function resolveWindowsBinaryExtension(binary: string, env: NodeJS.ProcessEnv): string | null {
+	const explicitExtension = extname(binary.trim());
+	if (explicitExtension) {
+		return explicitExtension.toLowerCase();
+	}
+	return resolveWindowsBinary(binary, env)?.extension ?? null;
 }
 
 function normalizeWindowsCmdArgument(value: string): string {
