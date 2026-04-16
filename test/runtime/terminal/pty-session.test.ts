@@ -155,7 +155,7 @@ describe("PtySession", () => {
 		}
 
 		expect(ptyMocks.spawn).toHaveBeenCalledTimes(1);
-		expect(ptyMocks.spawn.mock.calls[0]?.[0]).toBe("codex");
+		expect(ptyMocks.spawn.mock.calls[0]?.[0]).toBe(join(windowsBinDir, "codex.exe"));
 		expect(ptyMocks.spawn.mock.calls[0]?.[1]).toEqual(["--foo", "bar"]);
 	});
 
@@ -216,7 +216,7 @@ describe("PtySession", () => {
 		});
 
 		expect(ptyMocks.spawn).toHaveBeenCalledTimes(1);
-		expect(ptyMocks.spawn.mock.calls[0]?.[0]).toBe("cmd.exe");
+		expect(ptyMocks.spawn.mock.calls[0]?.[0].toLowerCase()).toMatch(/(?:^|[\\/])cmd\.exe$/u);
 	});
 
 	it("ignores resize calls after the pty has exited", () => {

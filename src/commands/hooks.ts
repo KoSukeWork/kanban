@@ -601,7 +601,7 @@ export function buildCodexWrapperSpawn(
 	agentArgs: string[],
 	platform: NodeJS.Platform = process.platform,
 	env: NodeJS.ProcessEnv = process.env,
-): { binary: string; args: string[] } {
+): { binary: string; args: string[]; windowsVerbatimArguments?: boolean } {
 	const childArgs = buildCodexWrapperChildArgs(agentArgs);
 	if (!shouldUseWindowsCmdLaunch(realBinary, platform, env)) {
 		return {
@@ -612,6 +612,7 @@ export function buildCodexWrapperSpawn(
 	return {
 		binary: resolveWindowsComSpec(env),
 		args: buildWindowsCmdArgsArray(realBinary, childArgs),
+		windowsVerbatimArguments: true,
 	};
 }
 
@@ -663,6 +664,7 @@ async function runCodexWrapperSubcommand(wrapperArgs: CodexWrapperArgs): Promise
 	const child = spawn(childLaunch.binary, childLaunch.args, {
 		stdio: "inherit",
 		env: childEnv,
+		windowsVerbatimArguments: childLaunch.windowsVerbatimArguments,
 	});
 
 	const forwardSignal = (signal: NodeJS.Signals) => {
