@@ -1,4 +1,5 @@
 import { spawn } from "node:child_process";
+import { terminateProcessForTimeout } from "./process-termination";
 
 interface DirectoryPickerCommandCandidate {
 	command: string;
@@ -23,8 +24,12 @@ type RunCommand = (command: string, args: string[]) => Promise<DirectoryPickerCo
 interface PickDirectoryPathFromSystemDialogOptions {
 	platform?: NodeJS.Platform;
 	cwd?: string;
+	timeoutMs?: number;
 	runCommand?: RunCommand;
 }
+
+const DEFAULT_DIRECTORY_PICKER_TIMEOUT_MS = 5 * 60 * 1000;
+const DIRECTORY_PICKER_CLOSE_GRACE_MS = 1_000;
 
 const WINDOWS_DIRECTORY_PICKER_SCRIPT = [
 	"$ErrorActionPreference = 'Stop'",
@@ -60,7 +65,20 @@ function parseChildProcessErrorCode(error: unknown): string | null {
 	return typeof code === "string" ? code : null;
 }
 
-async function defaultRunCommand(command: string, args: string[]): Promise<DirectoryPickerCommandExecutionResult> {
+function createDirectoryPickerTimeoutError(timeoutMs: number): NodeJS.ErrnoException {
+	return Object.assign(new Error(`Directory picker timed out after ${timeoutMs}ms.`), {
+		code: "ETIMEDOUT",
+	}) as NodeJS.ErrnoException;
+}
+
+async function defaultRunCommand(
+	command: string,
+	args: string[],
+	options: {
+		platform: NodeJS.Platform;
+		timeoutMs: number;
+	},
+): Promise<DirectoryPickerCommandExecutionResult> {
 	return await new Promise((resolve) => {
 		const child = spawn(command, args, {
 			stdio: ["ignore", "pipe", "pipe"],
@@ -69,12 +87,38 @@ async function defaultRunCommand(command: string, args: string[]): Promise<Direc
 		let stdout = "";
 		let stderr = "";
 		let settled = false;
+		let pendingError: NodeJS.ErrnoException | undefined;
+		let closeGraceHandle: NodeJS.Timeout | null = null;
+		const timeoutHandle =
+			options.timeoutMs > 0
+				? setTimeout(() => {
+						pendingError ??= createDirectoryPickerTimeoutError(options.timeoutMs);
+						terminateProcessForTimeout(child, {
+							platform: options.platform,
+						});
+						closeGraceHandle = setTimeout(() => {
+							finish({
+								stdout,
+								stderr,
+								status: null,
+								signal: null,
+								error: pendingError,
+							});
+						}, DIRECTORY_PICKER_CLOSE_GRACE_MS);
+					}, options.timeoutMs)
+				: null;
 
 		const finish = (result: DirectoryPickerCommandExecutionResult): void => {
 			if (settled) {
 				return;
 			}
 			settled = true;
+			if (timeoutHandle) {
+				clearTimeout(timeoutHandle);
+			}
+			if (closeGraceHandle) {
+				clearTimeout(closeGraceHandle);
+			}
 			resolve(result);
 		};
 
@@ -89,13 +133,7 @@ async function defaultRunCommand(command: string, args: string[]): Promise<Direc
 		});
 
 		child.once("error", (error) => {
-			finish({
-				stdout,
-				stderr,
-				status: null,
-				signal: null,
-				error: error as NodeJS.ErrnoException,
-			});
+			pendingError ??= error as NodeJS.ErrnoException;
 		});
 
 		child.once("close", (status, signal) => {
@@ -104,6 +142,7 @@ async function defaultRunCommand(command: string, args: string[]): Promise<Direc
 				stderr,
 				status,
 				signal,
+				error: pendingError,
 			});
 		});
 	});
@@ -154,7 +193,14 @@ export async function pickDirectoryPathFromSystemDialog(
 ): Promise<string | null> {
 	const platform = options.platform ?? process.platform;
 	const cwd = options.cwd ?? process.cwd();
-	const runCommand = options.runCommand ?? defaultRunCommand;
+	const timeoutMs = options.timeoutMs ?? DEFAULT_DIRECTORY_PICKER_TIMEOUT_MS;
+	const runCommand =
+		options.runCommand ??
+		((command: string, args: string[]) =>
+			defaultRunCommand(command, args, {
+				platform,
+				timeoutMs,
+			}));
 
 	if (platform === "darwin") {
 		const result = await runDirectoryPickerCommand(
