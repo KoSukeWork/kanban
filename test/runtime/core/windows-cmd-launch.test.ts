@@ -33,6 +33,26 @@ describe("shouldUseWindowsCmdLaunch", () => {
 		expect(shouldUseWindowsCmdLaunch("codex.exe", "win32")).toBe(false);
 	});
 
+	it("resolves explicit .exe binaries from PATH", () => {
+		const tempDirectory = mkdtempSync(join(tmpdir(), "kanban-win-launch-"));
+		tempDirectories.push(tempDirectory);
+		const binaryPath = createWindowsBinary(tempDirectory, "codex.exe");
+
+		expect(
+			resolveWindowsLaunchDecision("codex.exe", "win32", {
+				PATH: tempDirectory,
+				PATHEXT: ".com;.exe;.bat;.cmd",
+				ComSpec: "C:\\Windows\\System32\\cmd.exe",
+			}),
+		).toEqual({
+			useWindowsShellLaunch: false,
+			resolvedBinary: {
+				path: binaryPath,
+				extension: ".exe",
+			},
+		});
+	});
+
 	it("returns true for explicit .cmd shims", () => {
 		expect(shouldUseWindowsCmdLaunch("codex.cmd", "win32")).toBe(true);
 	});
