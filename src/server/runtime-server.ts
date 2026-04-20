@@ -66,6 +66,7 @@ export interface CreateRuntimeServerDependencies {
 	) => DisposeTrackedWorkspaceResult;
 	collectProjectWorktreeTaskIdsForRemoval: (board: RuntimeWorkspaceStateResponse["board"]) => Set<string>;
 	pickDirectoryPathFromSystemDialog: () => string | null;
+	requestRuntimeShutdown?: () => void;
 }
 
 export interface RuntimeServer {
@@ -270,6 +271,33 @@ export async function createRuntimeServer(deps: CreateRuntimeServerDependencies)
 		try {
 			const requestUrl = new URL(req.url ?? "/", "http://localhost");
 			const pathname = normalizeRequestPath(requestUrl.pathname);
+
+			if (req.method === "POST" && pathname === "/api/service/shutdown") {
+				if (!deps.requestRuntimeShutdown) {
+					res.writeHead(404, { "Content-Type": "application/json; charset=utf-8" });
+					res.end('{"error":"Not found"}');
+					return;
+				}
+				const bearerToken = extractBearerToken(req.headers.authorization);
+				const internalAuth = bearerToken !== null && validateInternalToken(bearerToken);
+				if (!internalAuth) {
+					res.writeHead(401, {
+						"Content-Type": "application/json; charset=utf-8",
+						"Cache-Control": "no-store",
+					});
+					res.end('{"error":"Authentication required."}');
+					return;
+				}
+				res.writeHead(200, {
+					"Content-Type": "application/json; charset=utf-8",
+					"Cache-Control": "no-store",
+				});
+				res.end('{"ok":true}');
+				queueMicrotask(() => {
+					deps.requestRuntimeShutdown?.();
+				});
+				return;
+			}
 
 			// ── Passcode gate (remote mode only) ──────────────────────────────
 			const passcodeActive = isRemoteMode && isPasscodeEnabled();

@@ -61,15 +61,26 @@ function clearRuntimeFetchCache(): void {
 	_runtimeFetchPromise = undefined;
 }
 
+export function resetKanbanRuntimeFetchCache(): void {
+	clearRuntimeFetchCache();
+}
+
 export function getKanbanRuntimeTls(): RuntimeTlsConfig | null {
 	return runtimeTls;
 }
 
-export function setKanbanRuntimeTls(tls: RuntimeTlsConfig): void {
-	runtimeTls = tls;
-	runtimeHttps = true;
-	runtimeTlsCa = tls.ca?.trim() || null;
-	process.env[KANBAN_RUNTIME_HTTPS_ENV] = "1";
+export function getKanbanRuntimeTlsCa(): string | null {
+	return runtimeTlsCa;
+}
+
+export function setKanbanRuntimeHttpsState(input: { enabled: boolean; ca?: string | null }): void {
+	runtimeHttps = input.enabled;
+	runtimeTlsCa = input.ca?.trim() || null;
+	if (runtimeHttps) {
+		process.env[KANBAN_RUNTIME_HTTPS_ENV] = "1";
+	} else {
+		delete process.env[KANBAN_RUNTIME_HTTPS_ENV];
+	}
 	if (runtimeTlsCa) {
 		process.env[KANBAN_RUNTIME_TLS_CA_ENV] = runtimeTlsCa;
 	} else {
@@ -78,13 +89,20 @@ export function setKanbanRuntimeTls(tls: RuntimeTlsConfig): void {
 	clearRuntimeFetchCache();
 }
 
+export function setKanbanRuntimeTls(tls: RuntimeTlsConfig): void {
+	runtimeTls = tls;
+	setKanbanRuntimeHttpsState({
+		enabled: true,
+		ca: tls.ca,
+	});
+}
+
 export function clearKanbanRuntimeTls(): void {
 	runtimeTls = null;
-	runtimeTlsCa = null;
-	runtimeHttps = false;
-	delete process.env[KANBAN_RUNTIME_HTTPS_ENV];
-	delete process.env[KANBAN_RUNTIME_TLS_CA_ENV];
-	clearRuntimeFetchCache();
+	setKanbanRuntimeHttpsState({
+		enabled: false,
+		ca: null,
+	});
 }
 
 export function isKanbanRuntimeHttps(): boolean {
