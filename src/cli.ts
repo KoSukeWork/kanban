@@ -16,6 +16,7 @@ import {
 	installGracefulShutdownHandlers,
 	shouldSuppressImmediateDuplicateShutdownSignals,
 } from "./core/graceful-shutdown";
+import { buildKanbanCommandParts } from "./core/kanban-command";
 import {
 	buildKanbanRuntimeUrl,
 	clearKanbanRuntimeTls,
@@ -23,6 +24,7 @@ import {
 	getKanbanRuntimeHost,
 	getKanbanRuntimeOrigin,
 	getKanbanRuntimePort,
+	getKanbanRuntimeTls,
 	getRuntimeFetch,
 	isKanbanRemoteHost,
 	parseRuntimePort,
@@ -30,8 +32,24 @@ import {
 	setKanbanRuntimePort,
 	setKanbanRuntimeTls,
 } from "./core/runtime-endpoint";
-import { disablePasscode, generateInternalToken, generatePasscode } from "./security/passcode-manager";
-import { terminateProcessForTimeout } from "./server/process-termination";
+import {
+	applyKanbanServiceStateToRuntime,
+	clearKanbanServiceStartupError,
+	clearKanbanServiceState,
+	createKanbanServiceState,
+	type KanbanServiceState,
+	loadKanbanServiceStartupError,
+	loadKanbanServiceState,
+	writeKanbanServiceStartupError,
+	writeKanbanServiceState,
+} from "./core/service-state";
+import {
+	disablePasscode,
+	generateInternalToken,
+	generatePasscode,
+	getInternalToken,
+} from "./security/passcode-manager";
+import { isProcessRunning, terminateProcessForTimeout, terminateProcessId } from "./server/process-termination";
 import type { RuntimeStateHub } from "./server/runtime-state-hub";
 import { captureNodeException, flushNodeTelemetry } from "./telemetry/sentry-node.js";
 import type { TerminalSessionManager } from "./terminal/session-manager";
@@ -77,11 +95,35 @@ interface RootCommandOptions {
 	noPasscode?: boolean;
 }
 
+interface ServiceCommandOptions {
+	host?: string;
+	port?: { mode: "fixed"; value: number } | { mode: "auto" };
+	skipShutdownCleanup?: boolean;
+	https?: boolean;
+	cert?: string;
+	key?: string;
+	noPasscode?: boolean;
+}
+
+type RuntimeLaunchMode = "foreground" | "service";
 type ShutdownIndicatorResult = "done" | "interrupted" | "failed";
 
 interface ShutdownIndicator {
 	start: () => void;
 	stop: (result?: ShutdownIndicatorResult) => void;
+}
+
+interface RuntimeLaunchBehavior {
+	mode: RuntimeLaunchMode;
+	shouldAutoOpenBrowser: boolean;
+}
+
+interface ServiceHealthStatus {
+	state: KanbanServiceState | null;
+	health: "running" | "stopped" | "unhealthy" | "stale";
+	processRunning: boolean;
+	reachable: boolean;
+	origin: string | null;
 }
 
 /**
@@ -121,6 +163,68 @@ function shouldAutoOpenBrowserTabForInvocation(argv: string[]): boolean {
 	}
 
 	return true;
+}
+
+function isServiceRunInvocation(argv: string[]): boolean {
+	return argv[0] === "service-run";
+}
+
+function shouldKeepRuntimeProcessAliveAfterParse(argv: string[]): boolean {
+	return shouldAutoOpenBrowserTabForInvocation(argv) || isServiceRunInvocation(argv);
+}
+
+function normalizeRootCliOptions(options: RootCommandOptions): CliOptions {
+	return {
+		host: options.host ?? null,
+		port: options.port ?? null,
+		noOpen: options.open === false,
+		skipShutdownCleanup: options.skipShutdownCleanup === true,
+		https: options.https === true,
+		cert: options.cert ?? null,
+		key: options.key ?? null,
+		noPasscode: options.noPasscode === true,
+	};
+}
+
+function normalizeServiceCliOptions(options: ServiceCommandOptions): CliOptions {
+	return {
+		host: options.host ?? null,
+		port: options.port ?? null,
+		noOpen: true,
+		skipShutdownCleanup: options.skipShutdownCleanup === true,
+		https: options.https === true,
+		cert: options.cert ?? null,
+		key: options.key ?? null,
+		noPasscode: options.noPasscode === true,
+	};
+}
+
+function mergeRestartCliOptions(options: CliOptions, previousState: KanbanServiceState | null): CliOptions {
+	if (!previousState) {
+		return options;
+	}
+	const cert = options.cert ?? previousState.certPath;
+	const key = options.key ?? previousState.keyPath;
+	return {
+		...options,
+		host: options.host ?? previousState.host,
+		port: options.port ?? { mode: "fixed", value: previousState.port },
+		https: options.https || previousState.https || cert !== null || key !== null,
+		cert,
+		key,
+		noPasscode: options.noPasscode || previousState.noPasscode,
+		skipShutdownCleanup: options.skipShutdownCleanup || previousState.skipShutdownCleanup,
+	};
+}
+
+async function sleep(delayMs: number): Promise<void> {
+	await new Promise<void>((resolveDelay) => {
+		setTimeout(resolveDelay, delayMs);
+	});
+}
+
+function formatTimestamp(timestamp: number): string {
+	return new Date(timestamp).toISOString();
 }
 
 function createShutdownIndicator(stream: NodeJS.WriteStream = process.stderr): ShutdownIndicator {
@@ -312,6 +416,228 @@ async function tryOpenExistingServer(options: { noOpen: boolean; shouldAutoOpenB
 	return true;
 }
 
+async function hydrateRuntimeFromManagedServiceIfAvailable(): Promise<void> {
+	const state = await loadKanbanServiceState().catch(() => null);
+	if (!state) {
+		return;
+	}
+	if (!isProcessRunning(state.pid)) {
+		await clearKanbanServiceState({ onlyIfPid: state.pid }).catch(() => {});
+		return;
+	}
+	applyKanbanServiceStateToRuntime(state);
+}
+
+async function readServiceHealthStatus(): Promise<ServiceHealthStatus> {
+	const state = await loadKanbanServiceState();
+	if (!state) {
+		return {
+			state: null,
+			health: "stopped",
+			processRunning: false,
+			reachable: false,
+			origin: null,
+		};
+	}
+
+	const processRunning = isProcessRunning(state.pid);
+	applyKanbanServiceStateToRuntime(state);
+	const reachable = processRunning ? await canReachKanbanServer(null) : false;
+	return {
+		state,
+		health: reachable ? "running" : processRunning ? "unhealthy" : "stale",
+		processRunning,
+		reachable,
+		origin: getKanbanRuntimeOrigin(),
+	};
+}
+
+async function waitForProcessExitByPid(pid: number, timeoutMs: number): Promise<boolean> {
+	const startedAt = Date.now();
+	while (Date.now() - startedAt < timeoutMs) {
+		if (!isProcessRunning(pid)) {
+			return true;
+		}
+		await sleep(100);
+	}
+	return !isProcessRunning(pid);
+}
+
+async function requestManagedServiceShutdown(): Promise<void> {
+	const runtimeFetch = await getRuntimeFetch();
+	const response = await runtimeFetch(buildKanbanRuntimeUrl("/api/service/shutdown"), {
+		method: "POST",
+		signal: AbortSignal.timeout(3_000),
+	});
+	if (!response.ok) {
+		const payload = (await response.json().catch(() => null)) as { error?: unknown } | null;
+		const errorMessage =
+			payload && typeof payload.error === "string"
+				? payload.error
+				: `Shutdown request failed with HTTP ${response.status}.`;
+		throw new Error(errorMessage);
+	}
+}
+
+function ensureServiceModeCanStart(options: CliOptions): void {
+	const resolvedHost = options.host?.trim();
+	if (resolvedHost) {
+		setKanbanRuntimeHost(resolvedHost);
+	}
+	if (isKanbanRemoteHost() && !options.noPasscode) {
+		throw new Error(
+			'Background service mode does not support auto-generated remote passcodes. Re-run with "--no-passcode" behind your own auth layer, or launch Kanban in the foreground once to read the generated passcode.',
+		);
+	}
+}
+
+function buildServiceRunArgs(options: CliOptions): string[] {
+	const args = ["service-run"];
+	if (options.host) {
+		args.push("--host", options.host);
+	}
+	if (options.port) {
+		args.push("--port", options.port.mode === "auto" ? "auto" : String(options.port.value));
+	}
+	if (options.skipShutdownCleanup) {
+		args.push("--skip-shutdown-cleanup");
+	}
+	if (options.https) {
+		args.push("--https");
+	}
+	if (options.cert) {
+		args.push("--cert", options.cert);
+	}
+	if (options.key) {
+		args.push("--key", options.key);
+	}
+	if (options.noPasscode) {
+		args.push("--no-passcode");
+	}
+	return args;
+}
+
+async function waitForManagedServiceStartup(pid: number, timeoutMs = 15_000): Promise<KanbanServiceState> {
+	const startedAt = Date.now();
+	while (Date.now() - startedAt < timeoutMs) {
+		const startupError = await loadKanbanServiceStartupError();
+		if (startupError) {
+			throw new Error(startupError.message);
+		}
+
+		const state = await loadKanbanServiceState().catch(() => null);
+		if (state && state.pid === pid) {
+			applyKanbanServiceStateToRuntime(state);
+			if (await canReachKanbanServer(null)) {
+				await clearKanbanServiceStartupError().catch(() => {});
+				return state;
+			}
+		}
+
+		if (!isProcessRunning(pid)) {
+			break;
+		}
+
+		await sleep(150);
+	}
+
+	const startupError = await loadKanbanServiceStartupError();
+	if (startupError) {
+		throw new Error(startupError.message);
+	}
+
+	throw new Error("Background service did not become ready before the startup timeout.");
+}
+
+async function startManagedService(options: CliOptions): Promise<KanbanServiceState> {
+	ensureServiceModeCanStart(options);
+
+	const currentStatus = await readServiceHealthStatus();
+	if (currentStatus.health === "running" && currentStatus.state) {
+		return currentStatus.state;
+	}
+	if (currentStatus.health === "unhealthy" && currentStatus.state) {
+		throw new Error(
+			`Kanban service process ${currentStatus.state.pid} is already running but not responding at ${currentStatus.origin}. Use "kanban restart" to recover it.`,
+		);
+	}
+	if (currentStatus.state) {
+		await clearKanbanServiceState({ onlyIfPid: currentStatus.state.pid }).catch(() => {});
+	}
+
+	await clearKanbanServiceStartupError().catch(() => {});
+
+	const commandParts = buildKanbanCommandParts(buildServiceRunArgs(options));
+	const child = spawn(commandParts[0], commandParts.slice(1), {
+		cwd: process.cwd(),
+		env: process.env,
+		detached: true,
+		stdio: "ignore",
+		windowsHide: true,
+	});
+
+	if (typeof child.pid !== "number" || child.pid <= 0) {
+		throw new Error("Could not determine the background service process ID.");
+	}
+
+	child.unref();
+	return await waitForManagedServiceStartup(child.pid);
+}
+
+async function stopManagedService(): Promise<{
+	result: "already_stopped" | "stopped" | "terminated" | "stale";
+	state: KanbanServiceState | null;
+	origin: string | null;
+}> {
+	const status = await readServiceHealthStatus();
+	if (!status.state) {
+		return {
+			result: "already_stopped",
+			state: null,
+			origin: null,
+		};
+	}
+
+	if (status.health === "running") {
+		try {
+			await requestManagedServiceShutdown();
+		} catch {
+			// Fall through to best-effort termination if graceful shutdown cannot be requested.
+		}
+
+		const exited = await waitForProcessExitByPid(status.state.pid, 10_000);
+		if (exited) {
+			await clearKanbanServiceState({ onlyIfPid: status.state.pid }).catch(() => {});
+			return {
+				result: "stopped",
+				state: status.state,
+				origin: status.origin,
+			};
+		}
+	}
+
+	if (status.processRunning) {
+		terminateProcessId(status.state.pid);
+		const terminated = await waitForProcessExitByPid(status.state.pid, 5_000);
+		if (!terminated) {
+			throw new Error(`Timed out waiting for service process ${status.state.pid} to stop.`);
+		}
+		await clearKanbanServiceState({ onlyIfPid: status.state.pid }).catch(() => {});
+		return {
+			result: "terminated",
+			state: status.state,
+			origin: status.origin,
+		};
+	}
+
+	await clearKanbanServiceState({ onlyIfPid: status.state.pid }).catch(() => {});
+	return {
+		result: "stale",
+		state: status.state,
+		origin: status.origin,
+	};
+}
+
 async function runScopedCommand(command: string, cwd: string): Promise<RuntimeCommandRunResponse> {
 	const startedAt = Date.now();
 	const outputLimitBytes = 64 * 1024;
@@ -375,6 +701,7 @@ async function startServer(): Promise<{
 	url: string;
 	close: () => Promise<void>;
 	shutdown: (options?: { skipSessionCleanup?: boolean }) => Promise<void>;
+	setShutdownRequestHandler: (handler: (() => void) | null) => void;
 }> {
 	/*
 		Server-only modules are loaded lazily because task-oriented subcommands like
@@ -436,6 +763,8 @@ async function startServer(): Promise<{
 		return disposed;
 	};
 
+	let requestRuntimeShutdown: (() => void) | null = null;
+
 	const runtimeServer = await createRuntimeServer({
 		workspaceRegistry,
 		runtimeStateHub: runtimeHub,
@@ -451,6 +780,9 @@ async function startServer(): Promise<{
 		disposeWorkspace: disposeTrackedWorkspace,
 		collectProjectWorktreeTaskIdsForRemoval,
 		pickDirectoryPathFromSystemDialog,
+		requestRuntimeShutdown: () => {
+			requestRuntimeShutdown?.();
+		},
 	});
 
 	const close = async () => {
@@ -472,6 +804,9 @@ async function startServer(): Promise<{
 		url: runtimeServer.url,
 		close,
 		shutdown,
+		setShutdownRequestHandler: (handler) => {
+			requestRuntimeShutdown = handler;
+		},
 	};
 }
 
@@ -495,10 +830,13 @@ async function startServerWithAutoPortRetry(options: CliOptions): Promise<Awaite
 	}
 }
 
-async function runMainCommand(options: CliOptions, shouldAutoOpenBrowser: boolean): Promise<void> {
+async function runRuntimeCommand(options: CliOptions, behavior: RuntimeLaunchBehavior): Promise<void> {
 	if (options.host) {
 		setKanbanRuntimeHost(options.host);
 		console.log(`Binding to host ${options.host}.`);
+	}
+	if (behavior.mode === "service") {
+		ensureServiceModeCanStart(options);
 	}
 
 	const [{ openInBrowser }, { autoUpdateOnStartup, runPendingAutoUpdateOnShutdown }] = await Promise.all([
@@ -514,6 +852,10 @@ async function runMainCommand(options: CliOptions, shouldAutoOpenBrowser: boolea
 	const tlsResult = await resolveRuntimeTls(options);
 	if (tlsResult.enabled) {
 		console.log(`HTTPS enabled on ${getKanbanRuntimeOrigin()}`);
+	}
+
+	if (behavior.mode === "service") {
+		generateInternalToken();
 	}
 
 	// Handle passcode generation for remote mode — deferred until after TLS
@@ -539,17 +881,59 @@ async function runMainCommand(options: CliOptions, shouldAutoOpenBrowser: boolea
 	try {
 		runtime = await startServerWithAutoPortRetry(options);
 	} catch (error) {
-		if (
-			options.port?.mode !== "auto" &&
-			isAddressInUseError(error) &&
-			(await tryOpenExistingServer({ noOpen: options.noOpen, shouldAutoOpenBrowser }))
-		) {
-			return;
+		if (options.port?.mode !== "auto" && isAddressInUseError(error)) {
+			if (behavior.mode === "foreground") {
+				if (
+					await tryOpenExistingServer({
+						noOpen: options.noOpen,
+						shouldAutoOpenBrowser: behavior.shouldAutoOpenBrowser,
+					})
+				) {
+					return;
+				}
+			} else if (await canReachKanbanServer(null)) {
+				throw new Error(
+					`Kanban is already running at ${getKanbanRuntimeOrigin()} but is not managed by this service state file.`,
+				);
+			}
 		}
 		throw error;
 	}
+
+	if (behavior.mode === "service") {
+		const internalAuthToken = getInternalToken();
+		if (!internalAuthToken) {
+			await runtime.shutdown({
+				skipSessionCleanup: options.skipShutdownCleanup,
+			});
+			throw new Error("Background service did not initialize an internal auth token.");
+		}
+		try {
+			await writeKanbanServiceState(
+				createKanbanServiceState({
+					pid: process.pid,
+					host: getKanbanRuntimeHost(),
+					port: getKanbanRuntimePort(),
+					tls: getKanbanRuntimeTls(),
+					internalAuthToken,
+					cwd: process.cwd(),
+					skipShutdownCleanup: options.skipShutdownCleanup,
+					certPath: options.cert ? resolve(options.cert) : null,
+					keyPath: options.key ? resolve(options.key) : null,
+					noPasscode: options.noPasscode,
+				}),
+			);
+			await clearKanbanServiceStartupError().catch(() => {});
+		} catch (error) {
+			await runtime.shutdown({
+				skipSessionCleanup: options.skipShutdownCleanup,
+			});
+			throw error;
+		}
+	}
+
 	console.log(`Cline Kanban running at ${runtime.url}`);
-	if (!options.noOpen && shouldAutoOpenBrowser) {
+	if (behavior.mode === "foreground" && !options.noOpen && behavior.shouldAutoOpenBrowser) {
 		try {
 			openInBrowser(runtime.url, {
 				warn: (message) => {
@@ -561,24 +945,51 @@ async function runMainCommand(options: CliOptions, shouldAutoOpenBrowser: boolea
 			console.warn(`Could not open browser automatically: ${message}`);
 		}
 	}
-	console.log("Press Ctrl+C to stop.");
+	if (behavior.mode === "foreground") {
+		console.log("Press Ctrl+C to stop.");
+	}
 
-	let isShuttingDown = false;
 	const shutdownIndicator = createShutdownIndicator();
-	const shutdown = async () => {
-		if (isShuttingDown) {
+	let shutdownPromise: Promise<void> | null = null;
+	const shutdown = async (): Promise<void> => {
+		if (shutdownPromise) {
+			await shutdownPromise;
 			return;
 		}
-		isShuttingDown = true;
-		runPendingAutoUpdateOnShutdown();
-		if (options.skipShutdownCleanup) {
-			console.warn("Skipping shutdown task cleanup for this instance.");
-		}
-		await runtime.shutdown({
-			skipSessionCleanup: options.skipShutdownCleanup,
-		});
-		await disposeCliTelemetryService().catch(() => {});
+		shutdownPromise = (async () => {
+			runPendingAutoUpdateOnShutdown();
+			if (options.skipShutdownCleanup) {
+				console.warn("Skipping shutdown task cleanup for this instance.");
+			}
+			await runtime.shutdown({
+				skipSessionCleanup: options.skipShutdownCleanup,
+			});
+			if (behavior.mode === "service") {
+				await clearKanbanServiceState({ onlyIfPid: process.pid }).catch(() => {});
+			}
+			await disposeCliTelemetryService().catch(() => {});
+		})();
+		await shutdownPromise;
 	};
+
+	const requestProcessShutdown = () => {
+		void (async () => {
+			shutdownIndicator.start();
+			try {
+				await shutdown();
+				shutdownIndicator.stop("done");
+				process.exit(0);
+			} catch (error) {
+				shutdownIndicator.stop("failed");
+				captureNodeException(error, { area: "shutdown" });
+				const message = error instanceof Error ? error.message : String(error);
+				console.error(`Shutdown failed: ${message}`);
+				process.exit(1);
+			}
+		})();
+	};
+
+	runtime.setShutdownRequestHandler(behavior.mode === "service" ? requestProcessShutdown : null);
 
 	installGracefulShutdownHandlers({
 		process,
@@ -627,32 +1038,118 @@ async function runUpdateCommand(): Promise<void> {
 	throw new Error(result.message);
 }
 
-function createProgram(invocationArgs: string[]): Command {
-	const shouldAutoOpenBrowser = shouldAutoOpenBrowserTabForInvocation(invocationArgs);
-	const program = new Command();
-	program
-		.name("kanban")
-		.description("Local orchestration board for coding agents.")
-		.version(KANBAN_VERSION, "-v, --version", "Output the version number")
+function applySharedRuntimeLaunchOptions<T extends Command>(command: T): T {
+	return command
 		.option("--host <ip>", "Host IP to bind the server to (default: 127.0.0.1).")
 		.option("--port <number|auto>", "Runtime port (1-65535) or auto.", parseCliPortValue)
-		.option("--no-open", "Do not open browser automatically.")
 		.option("--skip-shutdown-cleanup", "Do not move sessions to trash or delete task worktrees on shutdown.")
 		.option("--https", "Enable HTTPS. Requires both --cert and --key.")
 		.option("--cert <path>", "Path to a TLS certificate PEM file (implies HTTPS).")
 		.option("--key <path>", "Path to a TLS private key PEM file (implies HTTPS).")
-		.option("--update", "Update Kanban to the latest published version and exit.")
 		.option(
 			"--no-passcode",
 			"Disable auto-generated passcode for remote access (for advanced users behind a reverse proxy).",
-		)
-		.showHelpAfterError()
-		.addHelpText("after", `\nRuntime URL: ${getKanbanRuntimeOrigin()}`);
+		);
+}
+
+function createProgram(invocationArgs: string[]): Command {
+	const shouldAutoOpenBrowser = shouldAutoOpenBrowserTabForInvocation(invocationArgs);
+	const program = new Command();
+	applySharedRuntimeLaunchOptions(
+		program
+			.name("kanban")
+			.description("Local orchestration board for coding agents.")
+			.version(KANBAN_VERSION, "-v, --version", "Output the version number")
+			.option("--no-open", "Do not open browser automatically.")
+			.option("--update", "Update Kanban to the latest published version and exit.")
+			.showHelpAfterError()
+			.addHelpText("after", `\nRuntime URL: ${getKanbanRuntimeOrigin()}`),
+	);
 
 	program.addOption(new Option("--agent <id>", "Deprecated compatibility flag. Ignored.").hideHelp());
 
 	registerTaskCommand(program);
 	registerHooksCommand(program);
+
+	applySharedRuntimeLaunchOptions(
+		program
+			.command("start")
+			.description("Start Kanban as a managed background service.")
+			.action(async (options: ServiceCommandOptions) => {
+				const state = await startManagedService(normalizeServiceCliOptions(options));
+				const origin = `${state.https ? "https" : "http"}://${state.host}:${state.port}`;
+				console.log(`Kanban service running at ${origin}`);
+				console.log(`PID: ${state.pid}`);
+				console.log(`Started: ${formatTimestamp(state.startedAt)}`);
+			}),
+	);
+
+	program
+		.command("stop")
+		.description("Stop the managed Kanban background service.")
+		.action(async () => {
+			const stopped = await stopManagedService();
+			if (stopped.result === "already_stopped") {
+				console.log("Kanban service is not running.");
+				return;
+			}
+			if (!stopped.state) {
+				console.log("Kanban service is not running.");
+				return;
+			}
+			if (stopped.result === "stopped") {
+				console.log(`Stopped Kanban service at ${stopped.origin}`);
+				return;
+			}
+			if (stopped.result === "terminated") {
+				console.log(`Terminated unresponsive Kanban service process ${stopped.state.pid}.`);
+				return;
+			}
+			console.log(`Removed stale Kanban service state for process ${stopped.state.pid}.`);
+		});
+
+	applySharedRuntimeLaunchOptions(
+		program
+			.command("restart")
+			.description("Restart the managed Kanban background service.")
+			.action(async (options: ServiceCommandOptions) => {
+				const previousState = await loadKanbanServiceState().catch(() => null);
+				await stopManagedService();
+				const state = await startManagedService(
+					mergeRestartCliOptions(normalizeServiceCliOptions(options), previousState),
+				);
+				const origin = `${state.https ? "https" : "http"}://${state.host}:${state.port}`;
+				console.log(`Kanban service running at ${origin}`);
+				console.log(`PID: ${state.pid}`);
+				console.log(`Started: ${formatTimestamp(state.startedAt)}`);
+			}),
+	);
+
+	program
+		.command("status")
+		.description("Show the managed Kanban background service status.")
+		.action(async () => {
+			const status = await readServiceHealthStatus();
+			if (!status.state) {
+				console.log("Kanban service is not running.");
+				return;
+			}
+			console.log(`Kanban service status: ${status.health}`);
+			if (status.origin) {
+				console.log(`URL: ${status.origin}`);
+			}
+			console.log(`PID: ${status.state.pid}`);
+			console.log(`Started: ${formatTimestamp(status.state.startedAt)}`);
+			console.log(`Working directory: ${status.state.cwd}`);
+			if (status.health === "unhealthy") {
+				console.log(
+					'The service process is alive but the runtime endpoint is not responding. Run "kanban restart".',
+				);
+			}
+			if (status.health === "stale") {
+				console.log('The recorded process no longer exists. Run "kanban start" or "kanban restart".');
+			}
+		});
 
 	program
 		.command("mcp")
@@ -668,24 +1165,27 @@ function createProgram(invocationArgs: string[]): Command {
 			await runUpdateCommand();
 		});
 
+	applySharedRuntimeLaunchOptions(
+		program
+			.command("service-run")
+			.description("Internal background service entrypoint.")
+			.action(async (options: ServiceCommandOptions) => {
+				await runRuntimeCommand(normalizeServiceCliOptions(options), {
+					mode: "service",
+					shouldAutoOpenBrowser: false,
+				});
+			}),
+	);
+
 	program.action(async (options: RootCommandOptions) => {
 		if (options.update === true) {
 			await runUpdateCommand();
 			return;
 		}
-		await runMainCommand(
-			{
-				host: options.host ?? null,
-				port: options.port ?? null,
-				noOpen: options.open === false,
-				skipShutdownCleanup: options.skipShutdownCleanup === true,
-				https: options.https === true,
-				cert: options.cert ?? null,
-				key: options.key ?? null,
-				noPasscode: options.noPasscode === true,
-			},
+		await runRuntimeCommand(normalizeRootCliOptions(options), {
+			mode: "foreground",
 			shouldAutoOpenBrowser,
-		);
+		});
 	});
 
 	return program;
@@ -693,15 +1193,21 @@ function createProgram(invocationArgs: string[]): Command {
 
 async function run(): Promise<void> {
 	const argv = process.argv.slice(2);
+	await hydrateRuntimeFromManagedServiceIfAvailable();
 	const program = createProgram(argv);
 	await program.parseAsync(argv, { from: "user" });
-	if (!shouldAutoOpenBrowserTabForInvocation(argv)) {
+	if (!shouldKeepRuntimeProcessAliveAfterParse(argv)) {
 		await Promise.allSettled([disposeCliTelemetryService(), flushNodeTelemetry()]);
-		process.exit(process.exitCode ?? 0);
+		process.exitCode = process.exitCode ?? 0;
 	}
 }
 
 void run().catch(async (error) => {
+	if (isServiceRunInvocation(process.argv.slice(2))) {
+		const message = error instanceof Error ? error.message : String(error);
+		await clearKanbanServiceState({ onlyIfPid: process.pid }).catch(() => {});
+		await writeKanbanServiceStartupError(message).catch(() => {});
+	}
 	captureNodeException(error, { area: "startup" });
 	await Promise.allSettled([disposeCliTelemetryService(), flushNodeTelemetry()]);
 	const message = error instanceof Error ? error.message : String(error);
