@@ -199,7 +199,7 @@ export function resolveWindowsLaunchDecision(
 	if (WINDOWS_DIRECT_EXTENSIONS.has(explicitExtension)) {
 		return {
 			useWindowsShellLaunch: false,
-			resolvedBinary: null,
+			resolvedBinary: resolveWindowsBinary(binary, env),
 		};
 	}
 
